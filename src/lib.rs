@@ -88,6 +88,34 @@ pub fn runtime() -> Result<Arc<tokio::runtime::Runtime>, Error> {
         .map_err(|e| Error::Other(format!("tokio runtime: {e}")))
 }
 
+/// Runtime handle used by the fabric: either a runtime it owns or a borrowed
+/// handle to a caller-owned runtime (e.g. a test running inside `#[tokio::test]`).
+#[derive(Clone)]
+enum Rt {
+    Owned(Arc<tokio::runtime::Runtime>),
+    Handle(tokio::runtime::Handle),
+}
+
+impl Rt {
+    fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match self {
+            Self::Owned(rt) => rt.spawn(future),
+            Self::Handle(h) => h.spawn(future),
+        }
+    }
+
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        match self {
+            Self::Owned(rt) => rt.block_on(future),
+            Self::Handle(h) => h.block_on(future),
+        }
+    }
+}
+
 /// A fabric over an iroh endpoint. Bind one with [`IrohFabric::bind`], set
 /// the pub/sub peer with [`IrohFabric::with_peer`], then use the ordinary
 /// [`Fabric`] patterns.
@@ -96,7 +124,7 @@ pub struct IrohFabric<C> {
     alpn: Vec<u8>,
     peer: Option<EndpointAddr>,
     codec: Arc<C>,
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: Rt,
 }
 
 impl<C> IrohFabric<C> {
@@ -122,7 +150,7 @@ impl<C> IrohFabric<C> {
             alpn: alpn.to_vec(),
             peer: None,
             codec: Arc::new(codec),
-            rt: Arc::new(rt),
+            rt: Rt::Owned(Arc::new(rt)),
         })
     }
 
@@ -144,7 +172,7 @@ impl<C> IrohFabric<C> {
             alpn: alpn.to_vec(),
             peer: None,
             codec: Arc::new(codec),
-            rt,
+            rt: Rt::Owned(rt),
         }
     }
 
@@ -176,9 +204,42 @@ impl<C> IrohFabric<C> {
     }
 
     /// The runtime this fabric drives its async work on.
+    ///
+    /// # Panics
+    /// Panics if the fabric was built with a borrowed runtime handle rather
+    /// than an owned runtime; use [`Self::handle`] in that case.
     #[must_use]
     pub fn runtime(&self) -> Arc<tokio::runtime::Runtime> {
-        Arc::clone(&self.rt)
+        match &self.rt {
+            Rt::Owned(rt) => Arc::clone(rt),
+            Rt::Handle(_) => panic!("fabric uses a borrowed runtime handle; no owned runtime"),
+        }
+    }
+
+    /// The runtime handle, available for both owned and borrowed runtimes.
+    #[must_use]
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        match &self.rt {
+            Rt::Owned(rt) => rt.handle().clone(),
+            Rt::Handle(h) => h.clone(),
+        }
+    }
+
+    /// Build a fabric around an existing endpoint and a borrowed tokio handle.
+    #[must_use]
+    pub fn from_endpoint_on_handle(
+        codec: C,
+        alpn: &[u8],
+        endpoint: Endpoint,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            endpoint,
+            alpn: alpn.to_vec(),
+            peer: None,
+            codec: Arc::new(codec),
+            rt: Rt::Handle(handle),
+        }
     }
 }
 
@@ -188,7 +249,7 @@ pub struct IrohRequester<Req, Res, C> {
     peer: Option<EndpointAddr>,
     alpn: Vec<u8>,
     codec: Arc<C>,
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: Rt,
     _p: std::marker::PhantomData<fn(Req, Res)>,
 }
 
@@ -238,7 +299,7 @@ pub struct IrohResponder<Req, Res, C> {
     codec: Arc<C>,
     stop: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: Rt,
     _p: std::marker::PhantomData<fn(Req, Res)>,
 }
 
@@ -306,7 +367,7 @@ pub struct IrohPublisher<T, C> {
     topic: Vec<u8>,
     subscribers: Arc<std::sync::Mutex<Vec<iroh::endpoint::Connection>>>,
     codec: Arc<C>,
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: Rt,
     _p: std::marker::PhantomData<fn(T)>,
 }
 
@@ -414,7 +475,7 @@ impl<C> Fabric<C> for IrohFabric<C> {
                 peer: self.peer.clone(),
                 alpn: self.alpn.clone(),
                 codec: Arc::clone(&self.codec),
-                rt: Arc::clone(&self.rt),
+                rt: self.rt.clone(),
                 _p: std::marker::PhantomData,
             },
             IrohResponder {
@@ -423,7 +484,7 @@ impl<C> Fabric<C> for IrohFabric<C> {
                 codec: Arc::clone(&self.codec),
                 stop: Arc::new(AtomicBool::new(false)),
                 task: None,
-                rt: Arc::clone(&self.rt),
+                rt: self.rt.clone(),
                 _p: std::marker::PhantomData,
             },
         ))
@@ -518,7 +579,7 @@ impl<C> Fabric<C> for IrohFabric<C> {
                 topic: topic_bytes,
                 subscribers,
                 codec: Arc::clone(&self.codec),
-                rt: Arc::clone(&self.rt),
+                rt: self.rt.clone(),
                 _p: std::marker::PhantomData,
             },
             IrohSubscriber {
