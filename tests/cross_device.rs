@@ -148,3 +148,43 @@ fn a_serde_row_reaches_a_subscriber_across_iroh() {
     };
     assert_eq!(got, row);
 }
+
+#[tokio::test]
+async fn async_adapters_carry_rows_across_iroh() {
+    let disco = MemoryLookup::new();
+    let (pub_ep, sub_ep) = {
+        let a = bind(&disco).await;
+        let b = bind(&disco).await;
+        disco.add_endpoint_info(a.addr());
+        disco.add_endpoint_info(b.addr());
+        (a, b)
+    };
+    // Keep the runtime alive past the async test's end (dropping a runtime
+    // inside an async context panics); in real use the fabric owns it.
+    let rt: &'static _ = Box::leak(Box::new(runtime().expect("runtime")));
+    let server = IrohFabric::from_endpoint(PostcardCodec, ALPN, pub_ep, rt.clone());
+    let client = IrohFabric::from_endpoint(PostcardCodec, ALPN, sub_ep, (*rt).clone())
+        .with_peer(server.addr());
+
+    let (requester, _client_res) = client.request_reply::<Row, Row>("async").unwrap();
+    let (_server_req, responder) = server.request_reply::<Row, Row>("async").unwrap();
+    let _serve = responder.serve(|row: Row| async move {
+        Row {
+            id: row.id + 1,
+            ..row
+        }
+    });
+
+    let requester = std::sync::Arc::new(requester);
+    let answer = fabric_iroh::call_async(
+        requester,
+        Row {
+            id: 9,
+            name: "async".into(),
+        },
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .expect("async call");
+    assert_eq!(answer.id, 10);
+}

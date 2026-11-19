@@ -516,3 +516,84 @@ impl<C> Fabric<C> for IrohFabric<C> {
         ))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Async adapters for callers already on a tokio reactor (e.g. flow).
+// The blocking Fabric methods run on spawn_blocking so they never stall a
+// worker; the medium's deadline still bounds the work itself.
+// ---------------------------------------------------------------------------
+
+/// Issue a request/reply call from an async caller without blocking a tokio
+/// worker. Use this instead of [`Requester::call`] inside an async context.
+///
+/// # Errors
+/// Whatever the fabric call returns, plus a task-join failure.
+pub async fn call_async<Req, Res, R>(
+    requester: Arc<R>,
+    req: Req,
+    deadline: Option<std::time::Duration>,
+) -> Result<Res, Error>
+where
+    R: Requester<Req, Res> + Send + Sync + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || requester.call(req, deadline))
+        .await
+        .map_err(|e| Error::Other(format!("call task failed: {e}")))?
+}
+
+/// Publish a value from an async caller without blocking a tokio worker.
+///
+/// # Errors
+/// Whatever the fabric publish returns, plus a task-join failure.
+pub async fn publish_async<T, P>(publisher: Arc<P>, value: T) -> Result<(), Error>
+where
+    P: Publisher<T> + Send + Sync + 'static,
+    T: Clone + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || publisher.publish(value))
+        .await
+        .map_err(|e| Error::Other(format!("publish task failed: {e}")))?
+}
+
+/// An async subscriber: drives the blocking [`Subscriber::next`] on a
+/// `spawn_blocking` task and yields values through a tokio mpsc receiver.
+pub struct AsyncSubscriber<T: Send + 'static> {
+    rx: tokio::sync::mpsc::Receiver<Result<T, Error>>,
+    _p: std::marker::PhantomData<fn(T)>,
+}
+
+impl<T: Send + 'static> AsyncSubscriber<T> {
+    /// Start forwarding from `subscriber`. Dropping the receiver stops it.
+    #[must_use]
+    pub fn spawn<S>(subscriber: S, buffer: usize) -> Self
+    where
+        S: Subscriber<T> + 'static,
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer);
+        tokio::task::spawn_blocking(move || {
+            while !tx.is_closed() {
+                let result = subscriber.next();
+                if tx.blocking_send(result).is_err() {
+                    break; // receiver dropped
+                }
+            }
+        });
+        Self {
+            rx,
+            _p: std::marker::PhantomData,
+        }
+    }
+
+    /// Receive the next value. `None` means the subscriber has closed.
+    pub async fn next(&mut self) -> Option<Result<T, Error>> {
+        self.rx.recv().await
+    }
+}
+
+impl<T: Send + 'static> std::fmt::Debug for AsyncSubscriber<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncSubscriber").finish_non_exhaustive()
+    }
+}
