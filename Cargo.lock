@@ -603,11 +603,12 @@ dependencies = [
 [[package]]
 name = "fabric"
 version = "0.1.0"
-source = "git+https://github.com/qretaio/fabric.git?branch=main#4b21f5009e8f49064b9205cbb7b2b1e8d5bbb6ab"
+source = "git+https://github.com/qretaio/fabric.git?branch=main#6cf09afcf712fbbb4811dadcd9034b25054d7a74"
 dependencies = [
  "postcard",
  "serde",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

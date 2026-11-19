@@ -62,14 +62,14 @@ fn a_serde_row_round_trips_between_two_iroh_endpoints() {
         }
     });
 
-    let answer = requester
-        .call(
+    let answer = rt
+        .block_on(requester.call(
             Row {
                 id: 41,
                 name: "row".into(),
             },
             Some(Duration::from_secs(10)),
-        )
+        ))
         .expect("a row crossed the iroh fabric");
     assert_eq!(
         answer,
@@ -92,20 +92,20 @@ fn a_deadline_holds_when_no_responder_serves() {
         (a, b)
     });
     let server = IrohFabric::from_endpoint(PostcardCodec, ALPN, server_ep, rt.clone());
-    let client =
-        IrohFabric::from_endpoint(PostcardCodec, ALPN, client_ep, rt).with_peer(server.addr());
+    let client = IrohFabric::from_endpoint(PostcardCodec, ALPN, client_ep, rt.clone())
+        .with_peer(server.addr());
 
     let (requester, _responder) = client
         .request_reply::<Row, Row>("no-server")
         .expect("req/rep pair");
-    let err = requester
-        .call(
+    let err = rt
+        .block_on(requester.call(
             Row {
                 id: 1,
                 name: "x".into(),
             },
             Some(Duration::from_millis(100)),
-        )
+        ))
         .expect_err("no responder is serving");
     assert!(matches!(err, Error::Deadline | Error::Other(_)));
 }
@@ -175,16 +175,15 @@ async fn async_adapters_carry_rows_across_iroh() {
         }
     });
 
-    let requester = std::sync::Arc::new(requester);
-    let answer = fabric_iroh::call_async(
-        requester,
-        Row {
-            id: 9,
-            name: "async".into(),
-        },
-        Some(Duration::from_secs(10)),
-    )
-    .await
-    .expect("async call");
+    let answer = requester
+        .call(
+            Row {
+                id: 9,
+                name: "async".into(),
+            },
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .expect("async call");
     assert_eq!(answer.id, 10);
 }

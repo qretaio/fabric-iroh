@@ -28,7 +28,6 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -107,14 +106,8 @@ impl Rt {
             Self::Handle(h) => h.spawn(future),
         }
     }
-
-    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
-        match self {
-            Self::Owned(rt) => rt.block_on(future),
-            Self::Handle(h) => h.block_on(future),
-        }
-    }
 }
+
 
 /// A fabric over an iroh endpoint. Bind one with [`IrohFabric::bind`], set
 /// the pub/sub peer with [`IrohFabric::with_peer`], then use the ordinary
@@ -249,7 +242,6 @@ pub struct IrohRequester<Req, Res, C> {
     peer: Option<EndpointAddr>,
     alpn: Vec<u8>,
     codec: Arc<C>,
-    rt: Rt,
     _p: std::marker::PhantomData<fn(Req, Res)>,
 }
 
@@ -259,13 +251,13 @@ where
     Res: Send + 'static,
     C: Codec<Req> + Codec<Res>,
 {
-    fn call(&self, req: Req, deadline: Option<Duration>) -> Result<Res, Error> {
+    async fn call(&self, req: Req, deadline: Option<Duration>) -> Result<Res, Error> {
         let req_bytes = self.codec.encode(&req)?;
         let endpoint = self.endpoint.clone();
         let peer = self.peer.clone();
         let alpn = self.alpn.clone();
         let codec = Arc::clone(&self.codec);
-        self.rt.block_on(async move {
+        {
             let fut = async {
                 let peer = peer.ok_or_else(|| {
                     Error::Other("iroh requester has no peer: call with_peer() first".into())
@@ -288,7 +280,7 @@ where
                     .map_err(|_| Error::Deadline)?,
                 None => fut.await,
             }
-        })
+        }
     }
 }
 
@@ -380,7 +372,7 @@ where
         let bytes = self.codec.encode(&value)?;
         let subscribers: Vec<_> = self.subscribers.lock().map_err(|_| Error::Closed)?.clone();
         let topic = self.topic.clone();
-        self.rt.block_on(async move {
+        self.rt.spawn(async move {
             for conn in subscribers {
                 let result = async {
                     let (mut send, _) = conn
@@ -400,14 +392,14 @@ where
                 // publication to the others.
                 let _ = result;
             }
-            Ok(())
-        })
+        });
+        Ok(())
     }
 }
 
 /// Subscriber half of an iroh pub/sub channel.
 pub struct IrohSubscriber<T, C> {
-    rx: Arc<std::sync::Mutex<std_mpsc::Receiver<Vec<u8>>>>,
+    rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
     codec: Arc<C>,
     _p: std::marker::PhantomData<fn(T)>,
 }
@@ -417,21 +409,19 @@ where
     T: Clone + Send + 'static,
     C: Codec<T>,
 {
-    fn next(&self) -> Result<T, Error> {
-        let bytes = self
-            .rx
-            .lock()
-            .map_err(|_| Error::Closed)?
-            .recv()
-            .map_err(|_| Error::Closed)?;
+    async fn next(&self) -> Result<T, Error> {
+        let bytes = self.rx.lock().await.recv().await.ok_or(Error::Closed)?;
         self.codec.decode(&bytes).map_err(Error::Codec)
     }
 
     fn try_next(&self) -> Result<Option<T>, Error> {
-        match self.rx.lock().map_err(|_| Error::Closed)?.try_recv() {
+        // try_next is only valid when no other task is awaiting `next`;
+        // try_lock keeps it non-blocking as the trait promises.
+        let mut rx = self.rx.try_lock().map_err(|_| Error::Refused)?;
+        match rx.try_recv() {
             Ok(bytes) => Ok(Some(self.codec.decode(&bytes).map_err(Error::Codec)?)),
-            Err(std_mpsc::TryRecvError::Empty) => Ok(None),
-            Err(std_mpsc::TryRecvError::Disconnected) => Err(Error::Closed),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => Err(Error::Closed),
         }
     }
 }
@@ -475,7 +465,6 @@ impl<C> Fabric<C> for IrohFabric<C> {
                 peer: self.peer.clone(),
                 alpn: self.alpn.clone(),
                 codec: Arc::clone(&self.codec),
-                rt: self.rt.clone(),
                 _p: std::marker::PhantomData,
             },
             IrohResponder {
@@ -538,7 +527,7 @@ impl<C> Fabric<C> for IrohFabric<C> {
         // published values off accepted bi-streams into a std channel.
         let endpoint = self.endpoint.clone();
         let sub_alpn = ps_alpn(&self.alpn);
-        let (tx, rx) = std_mpsc::sync_channel(64);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
         let topic_key = topic_bytes.clone();
         self.rt.spawn(async move {
             let Some(peer) = peer else {
@@ -565,7 +554,7 @@ impl<C> Fabric<C> for IrohFabric<C> {
                 }
                 match read_frame(&mut recv).await {
                     Ok(bytes) => {
-                        if tx.send(bytes).is_err() {
+                        if tx.send(bytes).await.is_err() {
                             break;
                         }
                     }
@@ -583,91 +572,10 @@ impl<C> Fabric<C> for IrohFabric<C> {
                 _p: std::marker::PhantomData,
             },
             IrohSubscriber {
-                rx: Arc::new(std::sync::Mutex::new(rx)),
+                rx: Arc::new(tokio::sync::Mutex::new(rx)),
                 codec: Arc::clone(&self.codec),
                 _p: std::marker::PhantomData,
             },
         ))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Async adapters for callers already on a tokio reactor (e.g. flow).
-// The blocking Fabric methods run on spawn_blocking so they never stall a
-// worker; the medium's deadline still bounds the work itself.
-// ---------------------------------------------------------------------------
-
-/// Issue a request/reply call from an async caller without blocking a tokio
-/// worker. Use this instead of [`Requester::call`] inside an async context.
-///
-/// # Errors
-/// Whatever the fabric call returns, plus a task-join failure.
-pub async fn call_async<Req, Res, R>(
-    requester: Arc<R>,
-    req: Req,
-    deadline: Option<std::time::Duration>,
-) -> Result<Res, Error>
-where
-    R: Requester<Req, Res> + Send + Sync + 'static,
-    Req: Send + 'static,
-    Res: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || requester.call(req, deadline))
-        .await
-        .map_err(|e| Error::Other(format!("call task failed: {e}")))?
-}
-
-/// Publish a value from an async caller without blocking a tokio worker.
-///
-/// # Errors
-/// Whatever the fabric publish returns, plus a task-join failure.
-pub async fn publish_async<T, P>(publisher: Arc<P>, value: T) -> Result<(), Error>
-where
-    P: Publisher<T> + Send + Sync + 'static,
-    T: Clone + Send + 'static,
-{
-    tokio::task::spawn_blocking(move || publisher.publish(value))
-        .await
-        .map_err(|e| Error::Other(format!("publish task failed: {e}")))?
-}
-
-/// An async subscriber: drives the blocking [`Subscriber::next`] on a
-/// `spawn_blocking` task and yields values through a tokio mpsc receiver.
-pub struct AsyncSubscriber<T: Send + 'static> {
-    rx: tokio::sync::mpsc::Receiver<Result<T, Error>>,
-    _p: std::marker::PhantomData<fn(T)>,
-}
-
-impl<T: Send + 'static> AsyncSubscriber<T> {
-    /// Start forwarding from `subscriber`. Dropping the receiver stops it.
-    #[must_use]
-    pub fn spawn<S>(subscriber: S, buffer: usize) -> Self
-    where
-        S: Subscriber<T> + 'static,
-    {
-        let (tx, rx) = tokio::sync::mpsc::channel(buffer);
-        tokio::task::spawn_blocking(move || {
-            while !tx.is_closed() {
-                let result = subscriber.next();
-                if tx.blocking_send(result).is_err() {
-                    break; // receiver dropped
-                }
-            }
-        });
-        Self {
-            rx,
-            _p: std::marker::PhantomData,
-        }
-    }
-
-    /// Receive the next value. `None` means the subscriber has closed.
-    pub async fn next(&mut self) -> Option<Result<T, Error>> {
-        self.rx.recv().await
-    }
-}
-
-impl<T: Send + 'static> std::fmt::Debug for AsyncSubscriber<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AsyncSubscriber").finish_non_exhaustive()
     }
 }
