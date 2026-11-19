@@ -167,6 +167,19 @@ impl<C> IrohFabric<C> {
     pub fn id(&self) -> EndpointId {
         self.endpoint.id()
     }
+
+    /// The endpoint this fabric uses, for consumers that need to pass it to
+    /// other iroh-based components (e.g. blobs) or to another fabric.
+    #[must_use]
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
+    /// The runtime this fabric drives its async work on.
+    #[must_use]
+    pub fn runtime(&self) -> Arc<tokio::runtime::Runtime> {
+        Arc::clone(&self.rt)
+    }
 }
 
 /// Caller half of an iroh request/reply channel.
